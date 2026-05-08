@@ -95,7 +95,6 @@ if archivo_nuevo and archivo_historial:
             df_final = pd.merge(df_nuevo, df_hist[cols_persistencia], on=col_llave, how='left')
 
             # --- FORMATEO DE TIPOS PARA EL EDITOR ---
-            # Convertir decimales a strings de porcentaje (ej: 0.75 -> 75%)
             def to_pct_str(val):
                 try:
                     num = float(val)
@@ -118,24 +117,38 @@ if archivo_nuevo and archivo_historial:
 
             df_final = df_final[COLUMNAS_FINALES]
 
-            # --- RESUMEN DE CASOS NUEVOS ---
-            st.subheader("Panel de Gestión")
+            # --- CAMBIO QUIRÚRGICO: REPORTE DE CASOS NUEVOS Y SALIENTES ---
+            st.subheader("Panel de Gestión Semanal")
+            
             casos_viejos = set(df_hist[col_llave].unique())
-            nuevos_detectados = [c for c in df_nuevo[col_llave].unique() if c not in casos_viejos]
-            st.success(f"🆕 **Resumen de Actualización:** Se han identificado **{len(nuevos_detectados)} casos nuevos** que no estaban en la hoja {hoja_maestra}.")
+            casos_actuales = set(df_nuevo[col_llave].unique())
+            
+            nuevos_detectados = [c for c in casos_actuales if c not in casos_viejos]
+            salientes_detectados = df_hist[~df_hist[col_llave].isin(casos_actuales)]
+            
+            col_res1, col_res2 = st.columns(2)
+            with col_res1:
+                st.success(f"🆕 **Ingresos:** Se incorporaron **{len(nuevos_detectados)} casos nuevos**.")
+            with col_res2:
+                st.warning(f"🔴 **Salidas:** **{len(salientes_detectados)} casos** del pipeline anterior ya no están en el reporte.")
+            
+            # Acordeón para revisar los casos que salieron del pipeline
+            if not salientes_detectados.empty:
+                with st.expander("🔍 Ver listado de casos salientes"):
+                    columnas_salientes = [col_llave, 'Nickname', 'Probabilidad cierre 2026', 'Observaciones']
+                    cols_mostrar = [c for c in columnas_salientes if c in salientes_detectados.columns]
+                    st.dataframe(salientes_detectados[cols_mostrar].fillna(''), hide_index=True)
 
-            # --- FUNCIÓN DE ESTILO (SEMÁFORO) ---
+            # --- FUNCIÓN DE ESTILO PARA STREAMLIT ---
             def color_semaforo(val):
-                color = ''
                 if val in ["75%", "100%"]:
-                    color = 'background-color: #c6efce; color: #006100;' # Verde
+                    return 'background-color: #c6efce; color: #006100;'
                 elif val == "50%":
-                    color = 'background-color: #ffeb9c; color: #9c5700;' # Amarillo
+                    return 'background-color: #ffeb9c; color: #9c5700;'
                 elif val in ["0%", "25%"]:
-                    color = 'background-color: #ffc7ce; color: #9c0006;' # Rojo
-                return color
+                    return 'background-color: #ffc7ce; color: #9c0006;'
+                return ''
 
-            # Aplicar estilo al DataFrame
             df_styled = df_final.style.map(color_semaforo, subset=['Probabilidad cierre 2026'])
 
             # --- EDITOR DE DATOS ---
@@ -144,8 +157,7 @@ if archivo_nuevo and archivo_historial:
                 column_config={
                     "Probabilidad cierre 2026": st.column_config.SelectboxColumn(
                         "Probabilidad (%)", 
-                        options=["0%", "25%", "50%", "75%", "100%"],
-                        help="Seleccione la probabilidad de cierre"
+                        options=["0%", "25%", "50%", "75%", "100%"]
                     ),
                     "Fecha probable de facturación": st.column_config.DateColumn("Fecha Fact."),
                     "Observaciones": st.column_config.TextColumn("Observaciones", width="large")
@@ -161,21 +173,49 @@ if archivo_nuevo and archivo_historial:
             
             st.metric("FACTURACIÓN PROBABLE TOTAL (UF)", f"{df_editado['Hon Probables 2026'].sum():,.2f}")
 
-            # --- DESCARGA (CONVERSIÓN A DECIMAL PARA EXCEL) ---
+            # --- CAMBIO QUIRÚRGICO: FORMATEO CONDICIONAL NATIVO PARA EXCEL ---
             fecha_desc = datetime.now().strftime("%d-%m-%y")
             buffer = io.BytesIO()
             df_excel = df_editado.copy()
+            
+            # Devolver a decimal para que Excel lo calcule matemáticamente
             df_excel['Probabilidad cierre 2026'] = df_excel['Probabilidad cierre 2026'].str.replace('%', '').astype(float) / 100
 
             with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-                df_excel.to_excel(writer, sheet_name=f"Casos {fecha_desc}", index=False)
+                nombre_hoja_descarga = f"Casos {fecha_desc}"
+                df_excel.to_excel(writer, sheet_name=nombre_hoja_descarga, index=False)
+                
+                # Obtener los objetos del libro y la hoja para inyectar formatos
+                workbook = writer.book
+                worksheet = writer.sheets[nombre_hoja_descarga]
+                
+                # Crear los formatos de Excel
+                formato_pct = workbook.add_format({'num_format': '0%'})
+                formato_verde = workbook.add_format({'bg_color': '#c6efce', 'font_color': '#006100'})
+                formato_amarillo = workbook.add_format({'bg_color': '#ffeb9c', 'font_color': '#9c5700'})
+                formato_rojo = workbook.add_format({'bg_color': '#ffc7ce', 'font_color': '#9c0006'})
+
+                # Encontrar el índice numérico de la columna de Probabilidad (base 0)
+                idx_prob = COLUMNAS_FINALES.index('Probabilidad cierre 2026')
+                
+                # Aplicar formato de porcentaje a toda la columna
+                worksheet.set_column(idx_prob, idx_prob, 15, formato_pct)
+                
+                # Aplicar el Semáforo Condicional directo al Excel
+                filas_totales = len(df_excel)
+                worksheet.conditional_format(1, idx_prob, filas_totales, idx_prob, 
+                                             {'type': 'cell', 'criteria': '>=', 'value': 0.75, 'format': formato_verde})
+                worksheet.conditional_format(1, idx_prob, filas_totales, idx_prob, 
+                                             {'type': 'cell', 'criteria': '==', 'value': 0.50, 'format': formato_amarillo})
+                worksheet.conditional_format(1, idx_prob, filas_totales, idx_prob, 
+                                             {'type': 'cell', 'criteria': '<=', 'value': 0.25, 'format': formato_rojo})
             
             st.sidebar.divider()
             st.sidebar.download_button(
-                label="📥 Descargar Pipeline con Formato",
+                label="📥 Descargar Pipeline Formateado",
                 data=buffer.getvalue(),
                 file_name=f"JPV_Pipeline_{fecha_desc}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
 else:
-    st.info("Sube los archivos para procesar el Pipeline. El sistema aplicará el semáforo de colores automáticamente.")
+    st.info("Sube los archivos para procesar el Pipeline. El sistema reportará ingresos, salidas y aplicará el formato al Excel.")

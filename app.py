@@ -12,121 +12,106 @@ PROB_MAP = {
     1.0: "Cierta"
 }
 
+# Columnas definitivas que debe tener el archivo de salida (según tu hoja base)
+COLUMNAS_FINALES = [
+    'Número de caso', 'Número de siniestro', 'Nickname', 'División', 
+    'Compañía de seguros', 'Corredora', 'Ajustador senior', 'Asegurado', 
+    'Creado en', 'Divisa', 'Perdida bruta (en moneda del caso)', 
+    'Deducible (en moneda del caso)', 'Monto asegurado (en moneda del caso)', 
+    'Honorarios (UF)', 'Facturado', 'Último movimiento', 
+    'Contenido último movimiento', 'Probabilidad cierre 2026', 
+    'Indicación Probabilidad', 'Hon Probables 2026', 'Observaciones', 
+    'Fecha probable de facturación'
+]
+
 st.set_page_config(page_title="JPV Pipeline y Seguimiento", layout="wide")
 st.title("🚀 JPV: Pipeline de Facturación Probable")
 
-# --- FUNCIÓN DE CARGA QUIRÚRGICA ---
 def cargar_excel_especifico(archivo, es_reporte_acciones=False):
     if archivo is None: return None
-    
-    # Si es el reporte de acciones, saltamos las 5 filas de identificación
     skip = 5 if es_reporte_acciones else 0
-    
     df = pd.read_excel(archivo, skiprows=skip)
-    
-    # Limpieza de nombres de columnas
     df.columns = [str(c).strip() for c in df.columns]
-    
-    # Eliminar filas completamente vacías que suelen quedar al final
-    df = df.dropna(how='all', axis=0)
-    
-    return df
+    return df.dropna(how='all', axis=0)
 
-# --- BARRA LATERAL ---
 st.sidebar.header("Carga de Documentos")
 archivo_nuevo = st.sidebar.file_uploader("1. Nuevo Reporte de Acciones (Excel)", type=["xlsx"])
 archivo_historial = st.sidebar.file_uploader("2. Pipeline Anterior (Excel Maestro)", type=["xlsx"])
 
 if archivo_nuevo and archivo_historial:
-    # Aplicamos el salto de filas solo al reporte nuevo
     df_nuevo = cargar_excel_especifico(archivo_nuevo, es_reporte_acciones=True)
     df_hist = cargar_excel_especifico(archivo_historial, es_reporte_acciones=False)
 
-    # Nombres posibles de la columna clave
-    posibles_nombres = ['Número de caso', 'Numero de caso', 'N° caso', 'Caso']
-    col_llave = next((c for c in df_nuevo.columns if c in posibles_nombres), None)
-
-    if not col_llave:
-        st.error(f"No se encontró la columna clave. Columnas detectadas en fila 6: {list(df_nuevo.columns[:5])}...")
+    col_llave = 'Número de caso'
+    
+    if col_llave not in df_nuevo.columns:
+        st.error(f"No se encontró la columna '{col_llave}' en el reporte de acciones.")
     else:
-        # Definir columnas de persistencia
-        cols_manuales = [col_llave, 'Probabilidad cierre 2026', 'Observaciones', 'Fecha probable de facturación']
-        
-        # Asegurar que existan en el historial para no romper el merge
-        for c in cols_manuales:
-            if c not in df_hist.columns:
-                df_hist[c] = 0.0 if 'Probabilidad' in c else ""
-
-        # Estandarizar tipo de dato para el cruce (evita ValueError)
+        # Estandarizar llave como texto
         df_nuevo[col_llave] = df_nuevo[col_llave].astype(str).str.strip().str.replace(r'\.0$', '', regex=True)
         df_hist[col_llave] = df_hist[col_llave].astype(str).str.strip().str.replace(r'\.0$', '', regex=True)
 
-        # Cruce de datos
+        # 1. PREPARAR HISTORIAL: Solo nos interesan las columnas manuales para el cruce
+        cols_a_recuperar = [col_llave, 'Probabilidad cierre 2026', 'Observaciones', 'Fecha probable de facturación']
+        # Si alguna no existe en el historial (caso raro), la creamos vacía
+        for c in cols_a_recuperar:
+            if c not in df_hist.columns: df_hist[c] = ""
+
+        # 2. CRUCE (LEFT JOIN): Mantenemos todo lo nuevo, pero traemos lo manual del pasado
         df_final = pd.merge(
             df_nuevo, 
-            df_hist[cols_manuales], 
+            df_hist[cols_a_recuperar], 
             on=col_llave, 
-            how='left', 
-            suffixes=('', '_old')
+            how='left'
         )
 
-        # --- CAMBIO QUIRÚRGICO: COMPATIBILIDAD DE TIPOS PARA STREAMLIT ---
-        # Aseguramos que los tipos de datos en el DataFrame coincidan exactamente con la configuración de la tabla
-        
-        # 1. Probabilidad debe ser numérico
+        # 3. LIMPIEZA POST-MERGE Y TIPOS DE DATOS
         df_final['Probabilidad cierre 2026'] = pd.to_numeric(df_final['Probabilidad cierre 2026'], errors='coerce').fillna(0.0)
-        
-        # 2. Fecha debe ser formato fecha real (evita que Streamlit falle al leer textos o NaNs)
-        df_final['Fecha probable de facturación'] = pd.to_datetime(df_final['Fecha probable de facturación'], errors='coerce').dt.date
-        
-        # 3. Observaciones debe ser texto puro (evita que los nulos se interpreten como flotantes)
         df_final['Observaciones'] = df_final['Observaciones'].astype(str).replace(['nan', 'None', '<NA>'], '')
-        # ------------------------------------------------------------------
-        
+        df_final['Fecha probable de facturación'] = pd.to_datetime(df_final['Fecha probable de facturación'], errors='coerce').dt.date
+
+        # 4. ASEGURAR COLUMNAS FALTANTES: Si el reporte de acciones no trae columnas del pipeline, las creamos
+        for col in COLUMNAS_FINALES:
+            if col not in df_final.columns:
+                df_final[col] = ""
+
+        # 5. CÁLCULOS INICIALES
+        df_final['Indicación Probabilidad'] = df_final['Probabilidad cierre 2026'].map(PROB_MAP)
+        if 'Honorarios (UF)' in df_final.columns:
+            df_final['Honorarios (UF)'] = pd.to_numeric(df_final['Honorarios (UF)'], errors='coerce').fillna(0)
+            df_final['Hon Probables 2026'] = df_final['Honorarios (UF)'] * df_final['Probabilidad cierre 2026']
+
+        # 6. FILTRAR Y ORDENAR: Solo dejamos las columnas que tú usas
+        df_final = df_final[COLUMNAS_FINALES]
+
         st.subheader("Panel de Gestión Semanal")
-        
-        # El editor de datos
         df_editado = st.data_editor(
             df_final,
             column_config={
-                "Probabilidad cierre 2026": st.column_config.SelectboxColumn(
-                    "Probabilidad (%)", 
-                    options=[0.0, 0.25, 0.50, 0.75, 1.0]
-                ),
+                "Probabilidad cierre 2026": st.column_config.SelectboxColumn("Probabilidad (%)", options=[0.0, 0.25, 0.50, 0.75, 1.0]),
                 "Fecha probable de facturación": st.column_config.DateColumn("Fecha Fact."),
                 "Observaciones": st.column_config.TextColumn("Observaciones", width="large")
             },
-            hide_index=True,
-            use_container_width=True
+            hide_index=True, use_container_width=True
         )
 
-        # --- LÓGICA DE CÁLCULOS ---
+        # Recalcular tras edición
         df_editado['Indicación Probabilidad'] = df_editado['Probabilidad cierre 2026'].map(PROB_MAP)
+        df_editado['Hon Probables 2026'] = df_editado['Honorarios (UF)'] * df_editado['Probabilidad cierre 2026']
         
-        # Identificar columna de honorarios
-        col_hon = next((c for c in df_editado.columns if 'Honorarios (UF)' in c), None)
-        
-        if col_hon:
-            df_editado[col_hon] = pd.to_numeric(df_editado[col_hon], errors='coerce').fillna(0)
-            df_editado['Hon Probables 2026'] = df_editado[col_hon] * df_editado['Probabilidad cierre 2026']
-            
-            # KPI
-            total_uf = df_editado['Hon Probables 2026'].sum()
-            st.metric("FACTURACIÓN PROBABLE TOTAL (UF)", f"{total_uf:,.2f}")
+        st.metric("FACTURACIÓN PROBABLE TOTAL (UF)", f"{df_editado['Hon Probables 2026'].sum():,.2f}")
 
-        # --- GENERACIÓN DE DESCARGA ---
+        # --- DESCARGA ---
         fecha_hoy = datetime.now().strftime("%d-%m-%y")
         buffer = io.BytesIO()
         with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-            # La hoja nueva se guarda con la fecha de hoy
             df_editado.to_excel(writer, sheet_name=f"Casos {fecha_hoy}", index=False)
         
-        st.sidebar.divider()
         st.sidebar.download_button(
-            label="📥 Descargar Pipeline Actualizado",
+            label="📥 Descargar Pipeline Limpio",
             data=buffer.getvalue(),
             file_name=f"JPV_Pipeline_{fecha_hoy}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 else:
-    st.info("Favor subir los archivos Excel. El sistema procesará el reporte desde la fila 6 automáticamente.")
+    st.info("Sube los archivos para procesar el Pipeline con las columnas seleccionadas.")

@@ -5,12 +5,13 @@ import io
 import re
 
 # --- CONFIGURACIÓN DE ETIQUETAS ---
+# Ahora mapeamos con los strings de porcentaje que verá el usuario
 PROB_MAP = {
-    0.0: "Nula",
-    0.25: "Remota",
-    0.50: "Podría Ser",
-    0.75: "Altamente probable",
-    1.0: "Cierta"
+    "0%": "Nula",
+    "25%": "Remota",
+    "50%": "Podría Ser",
+    "75%": "Altamente probable",
+    "100%": "Cierta"
 }
 
 COLUMNAS_FINALES = [
@@ -44,7 +45,7 @@ if archivo_nuevo and archivo_historial:
     hoja_maestra = None
     fecha_reciente = datetime.min
     
-    # Buscamos la hoja con la fecha más reciente en el nombre (formato dd-mm-yy)
+    # Buscamos la hoja con la fecha más reciente en el nombre
     for h in hojas:
         match = re.search(r'(\d{2}-\d{2}-\d{2})', h)
         if match:
@@ -96,8 +97,10 @@ if archivo_nuevo and archivo_historial:
             # --- CRUCE DE DATOS ---
             df_final = pd.merge(df_nuevo, df_hist[cols_persistencia], on=col_llave, how='left')
 
-            # Formatear para el editor
+            # --- CAMBIO QUIRÚRGICO 1: Formato Porcentaje para la Interfaz ---
             df_final['Probabilidad cierre 2026'] = pd.to_numeric(df_final['Probabilidad cierre 2026'], errors='coerce').fillna(0.0)
+            df_final['Probabilidad cierre 2026'] = (df_final['Probabilidad cierre 2026'] * 100).astype(int).astype(str) + "%"
+
             df_final['Observaciones'] = df_final['Observaciones'].astype(str).replace(['nan', 'None', '<NA>'], '')
             df_final['Fecha probable de facturación'] = pd.to_datetime(df_final['Fecha probable de facturación'], errors='coerce').dt.date
 
@@ -108,30 +111,59 @@ if archivo_nuevo and archivo_historial:
             df_final['Indicación Probabilidad'] = df_final['Probabilidad cierre 2026'].map(PROB_MAP)
             if 'Honorarios (UF)' in df_final.columns:
                 df_final['Honorarios (UF)'] = pd.to_numeric(df_final['Honorarios (UF)'], errors='coerce').fillna(0)
-                df_final['Hon Probables 2026'] = df_final['Honorarios (UF)'] * df_final['Probabilidad cierre 2026']
+                # Extraemos el valor numérico para calcular la tabla inicial
+                prob_num_inicial = df_final['Probabilidad cierre 2026'].str.replace('%', '', regex=False).astype(float) / 100.0
+                df_final['Hon Probables 2026'] = df_final['Honorarios (UF)'] * prob_num_inicial
 
             df_final = df_final[COLUMNAS_FINALES]
 
+            # --- CAMBIO QUIRÚRGICO 2: Resumen de Casos Nuevos ---
             st.subheader("Panel de Gestión")
+            
+            casos_nuevos = df_nuevo[~df_nuevo[col_llave].isin(df_hist[col_llave])]
+            num_casos_nuevos = len(casos_nuevos)
+            
+            st.success(f"🆕 **Resumen:** Se han incorporado **{num_casos_nuevos} casos nuevos** en este reporte de acciones respecto al pipeline histórico.")
+
+            # --- CAMBIO QUIRÚRGICO 3: Semáforo de Colores en la Tabla ---
+            def aplicar_colores(val):
+                if val in ["75%", "100%"]:
+                    return 'background-color: #c6efce; color: #006100;' # Verde
+                elif val == "50%":
+                    return 'background-color: #ffeb9c; color: #9c5700;' # Amarillo
+                elif val in ["0%", "25%"]:
+                    return 'background-color: #ffc7ce; color: #9c0006;' # Rojo
+                return ''
+
+            styled_df = df_final.style.map(aplicar_colores, subset=['Probabilidad cierre 2026'])
+
             df_editado = st.data_editor(
-                df_final,
+                styled_df,
                 column_config={
-                    "Probabilidad cierre 2026": st.column_config.SelectboxColumn("Probabilidad (%)", options=[0.0, 0.25, 0.50, 0.75, 1.0]),
+                    "Probabilidad cierre 2026": st.column_config.SelectboxColumn("Probabilidad (%)", options=["0%", "25%", "50%", "75%", "100%"]),
                     "Fecha probable de facturación": st.column_config.DateColumn("Fecha Fact."),
                     "Observaciones": st.column_config.TextColumn("Observaciones", width="large")
                 },
                 hide_index=True, use_container_width=True
             )
 
-            # Cálculo de KPI final
-            df_editado['Hon Probables 2026'] = df_editado['Honorarios (UF)'] * df_editado['Probabilidad cierre 2026']
+            # Cálculo de KPI final reconvirtiendo porcentaje a decimal
+            prob_num_final = df_editado['Probabilidad cierre 2026'].str.replace('%', '', regex=False).astype(float) / 100.0
+            df_editado['Hon Probables 2026'] = df_editado['Honorarios (UF)'] * prob_num_final
+            df_editado['Indicación Probabilidad'] = df_editado['Probabilidad cierre 2026'].map(PROB_MAP)
+            
             st.metric("FACTURACIÓN PROBABLE TOTAL (UF)", f"{df_editado['Hon Probables 2026'].sum():,.2f}")
 
             # --- BOTÓN DE DESCARGA ---
             fecha_descarga = datetime.now().strftime("%d-%m-%y")
             buffer = io.BytesIO()
+            
+            # --- CAMBIO QUIRÚRGICO 4: Devolver decimales para el Excel descargable ---
+            df_descarga = df_editado.copy()
+            df_descarga['Probabilidad cierre 2026'] = df_descarga['Probabilidad cierre 2026'].str.replace('%', '', regex=False).astype(float) / 100.0
+
             with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-                df_editado.to_excel(writer, sheet_name=f"Casos {fecha_descarga}", index=False)
+                df_descarga.to_excel(writer, sheet_name=f"Casos {fecha_descarga}", index=False)
             
             st.sidebar.divider()
             st.sidebar.download_button(

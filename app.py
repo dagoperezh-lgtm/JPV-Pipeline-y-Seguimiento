@@ -3,7 +3,7 @@ import pandas as pd
 from datetime import datetime
 import io
 
-# --- CONFIGURACIÓN Y MAPEOS ---
+# --- CONFIGURACIÓN ---
 PROB_MAP = {
     0.0: "Nula",
     0.25: "Remota",
@@ -13,120 +13,94 @@ PROB_MAP = {
 }
 
 st.set_page_config(page_title="JPV Pipeline y Seguimiento", layout="wide")
-
 st.title("🚀 JPV: Pipeline de Facturación Probable")
-st.markdown("Actualización semanal de casos y seguimiento de honorarios.")
 
-# --- 1. CARGA DE ARCHIVOS ---
-st.sidebar.header("Carga de Documentos Excel")
-# Configuramos para que acepte explícitamente Excel
-archivo_nuevo = st.sidebar.file_uploader("1. Nuevo Reporte de Acciones", type=["xlsx", "csv"])
+# --- FUNCIÓN DE CARGA SEGURA ---
+def cargar_excel_limpio(archivo):
+    if archivo is None: return None
+    # Leer excel
+    df = pd.read_excel(archivo)
+    
+    # Si la primera columna parece basura o vacía, reintentar buscando el encabezado
+    if "Unnamed" in str(df.columns[0]) or df.columns[0] == "" or len(df.columns) < 2:
+        df = pd.read_excel(archivo, skiprows=1) # Salta la primera fila de título si existe
+        
+    # Limpiar nombres de columnas (quitar espacios y saltos de línea)
+    df.columns = [str(c).strip() for c in df.columns]
+    return df
+
+# --- SIDEBAR ---
+st.sidebar.header("Carga de Documentos")
+archivo_nuevo = st.sidebar.file_uploader("1. Nuevo Reporte de Acciones (Excel)", type=["xlsx"])
 archivo_historial = st.sidebar.file_uploader("2. Pipeline Anterior (Archivo Maestro)", type=["xlsx"])
 
-def cargar_datos(archivo):
-    if archivo is None:
-        return None
-    if archivo.name.endswith('.xlsx'):
-        # Leer Excel (por defecto la primera hoja)
-        return pd.read_excel(archivo)
-    else:
-        # Leer CSV (con manejo de punto y coma o coma)
-        try:
-            return pd.read_csv(archivo, sep=';')
-        except:
-            return pd.read_csv(archivo, sep=',')
-
 if archivo_nuevo and archivo_historial:
-    df_nuevo = cargar_datos(archivo_nuevo)
+    df_nuevo = cargar_excel_limpio(archivo_nuevo)
     
-    # Para el historial, cargamos la hoja más reciente
     xl = pd.ExcelFile(archivo_historial)
     hoja_reciente = xl.sheet_names[0]
-    df_hist = pd.read_excel(archivo_historial, sheet_name=hoja_reciente)
-    
-    st.info(f"Cargado historial desde la hoja: {hoja_reciente}")
+    df_hist = cargar_excel_limpio(archivo_historial) # Carga la primera hoja por defecto
 
-    # --- 2. CRUCE DE DATOS ---
-    # Columnas de persistencia según tu archivo "Casos 30-04-26"
-    cols_manuales = [
-        'Número de caso', 
-        'Probabilidad cierre 2026', 
-        'Observaciones', 
-        'Fecha probable de facturación'
-    ]
-    
-    # Asegurar que las columnas existan en el histórico
-    for c in cols_manuales:
-        if c not in df_hist.columns:
-            df_hist[c] = None if c != 'Probabilidad cierre 2026' else 0.0
+    # --- VALIDACIÓN DE LLAVE (KeyError Fix) ---
+    # Buscamos cómo se llama la columna de 'Número de caso' realmente
+    posibles_nombres = ['Número de caso', 'Numero de caso', 'N° caso', 'Caso']
+    col_llave = next((c for c in df_nuevo.columns if c in posibles_nombres), None)
 
-    # Merge por 'Número de caso'
-    df_final = pd.merge(
-        df_nuevo, 
-        df_hist[cols_manuales], 
-        on='Número de caso', 
-        how='left', 
-        suffixes=('', '_old')
-    )
+    if not col_llave:
+        st.error(f"No encontré la columna 'Número de caso'. Columnas detectadas: {list(df_nuevo.columns[:5])}...")
+    else:
+        # Aseguramos que las columnas de persistencia existan
+        cols_manuales = [col_llave, 'Probabilidad cierre 2026', 'Observaciones', 'Fecha probable de facturación']
+        for c in cols_manuales:
+            if c not in df_hist.columns:
+                df_hist[c] = 0.0 if 'Probabilidad' in c else ""
 
-    # Rellenar nulos para evitar errores en el editor
-    df_final['Probabilidad cierre 2026'] = df_final['Probabilidad cierre 2026'].fillna(0.0)
+        # Cruce Seguro
+        df_final = pd.merge(
+            df_nuevo, 
+            df_hist[cols_manuales], 
+            on=col_llave, 
+            how='left', 
+            suffixes=('', '_old')
+        )
 
-    # --- 3. EDITOR DE DATOS ---
-    st.subheader("Panel de Edición Semanal")
-    
-    config_columnas = {
-        "Probabilidad cierre 2026": st.column_config.SelectboxColumn(
-            "Probabilidad (%)",
-            options=[0.0, 0.25, 0.50, 0.75, 1.0],
-            width="medium"
-        ),
-        "Fecha probable de facturación": st.column_config.DateColumn("Fecha Facturación"),
-        "Observaciones": st.column_config.TextColumn("Observaciones", width="large"),
-        "Indicación Probabilidad": st.column_config.TextColumn("Estado", disabled=True),
-        "Hon Probables 2026": st.column_config.NumberColumn("Hon Probables (UF)", format="%.2f", disabled=True)
-    }
+        # --- EDITOR Y CÁLCULOS ---
+        df_final['Probabilidad cierre 2026'] = df_final['Probabilidad cierre 2026'].fillna(0.0)
+        
+        st.subheader("Panel de Edición")
+        df_editado = st.data_editor(
+            df_final,
+            column_config={
+                "Probabilidad cierre 2026": st.column_config.SelectboxColumn("Probabilidad (%)", options=[0.0, 0.25, 0.50, 0.75, 1.0]),
+                "Fecha probable de facturación": st.column_config.DateColumn("Fecha Fact."),
+                "Observaciones": st.column_config.TextColumn("Observaciones", width="large")
+            },
+            hide_index=True,
+            use_container_width=True
+        )
 
-    df_editado = st.data_editor(
-        df_final,
-        column_config=config_columnas,
-        hide_index=True,
-        use_container_width=True
-    )
+        # Mapeo de etiquetas y KPI
+        df_editado['Indicación Probabilidad'] = df_editado['Probabilidad cierre 2026'].map(PROB_MAP)
+        
+        # Buscar columna de Honorarios para el total
+        col_hon = next((c for c in df_editado.columns if 'Honorarios' in c), None)
+        if col_hon:
+            df_editado[col_hon] = pd.to_numeric(df_editado[col_hon], errors='coerce').fillna(0)
+            df_editado['Hon Probables 2026'] = df_editado[col_hon] * df_editado['Probabilidad cierre 2026']
+            total_uf = df_editado['Hon Probables 2026'].sum()
+            st.metric("FACTURACIÓN PROBABLE TOTAL (UF)", f"{total_uf:,.2f}")
 
-    # --- 4. CÁLCULOS Y ETIQUETAS ---
-    df_editado['Indicación Probabilidad'] = df_editado['Probabilidad cierre 2026'].map(PROB_MAP)
-    
-    # Cálculo dinámico de honorarios
-    col_hon = 'Honorarios (UF)' if 'Honorarios (UF)' in df_editado.columns else None
-    if col_hon:
-        df_editado[col_hon] = pd.to_numeric(df_editado[col_hon], errors='coerce').fillna(0)
-        df_editado['Hon Probables 2026'] = df_editado[col_hon] * df_editado['Probabilidad cierre 2026']
-
-    # --- 5. KPI DE FACTURACIÓN ---
-    total_uf = df_editado['Hon Probables 2026'].sum() if 'Hon Probables 2026' in df_editado.columns else 0
-    
-    st.metric(label="FACTURACIÓN PROBABLE TOTAL (UF)", value=f"{total_uf:,.2f}")
-
-    # --- 6. EXPORTACIÓN A EXCEL ---
-    fecha_hoy = datetime.now().strftime("%d-%m-%y")
-    nombre_hoja = f"Casos {fecha_hoy}"
-
-    buffer = io.BytesIO()
-    with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-        df_editado.to_excel(writer, sheet_name=nombre_hoja, index=False)
-        # Mantener las hojas antiguas si es necesario
-        for s in xl.sheet_names:
-            if s != nombre_hoja:
-                pd.read_excel(archivo_historial, sheet_name=s).to_excel(writer, sheet_name=s, index=False)
-
-    st.sidebar.divider()
-    st.sidebar.download_button(
-        label="📥 Descargar Pipeline Excel",
-        data=buffer.getvalue(),
-        file_name=f"Pipeline_Facturacion_{fecha_hoy}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
-
+        # --- DESCARGA ---
+        fecha_hoy = datetime.now().strftime("%d-%m-%y")
+        buffer = io.BytesIO()
+        with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
+            df_editado.to_excel(writer, sheet_name=f"Casos {fecha_hoy}", index=False)
+        
+        st.sidebar.download_button(
+            label="📥 Descargar Pipeline",
+            data=buffer.getvalue(),
+            file_name=f"Pipeline_{fecha_hoy}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
 else:
-    st.warning("Favor subir los archivos Excel (.xlsx) en la barra lateral.")
+    st.info("Sube ambos archivos Excel para procesar el cruce.")
